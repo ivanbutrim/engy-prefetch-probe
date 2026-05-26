@@ -46,7 +46,7 @@ pip install -r requirements.txt
 
 ```bash
 export ENGY_USER=your_username
-export ENGY_PASSWORD=your_password
+read -s ENGY_PASSWORD && export ENGY_PASSWORD   # prompts silently, nothing in shell history
 python engy_prefetch_probe.py
 
 # Test against beta
@@ -84,7 +84,6 @@ If `#threads: 0`, the bug is confirmed and the query will crash with `IllegalArg
 ### Prerequisites
 
 - JDK 17+
-- Gradle (or use the wrapper if included)
 
 ### Setup & run
 
@@ -92,11 +91,11 @@ If `#threads: 0`, the bug is confirmed and the query will crash with `IllegalArg
 cd jdbc-probe
 
 export ENGY_USER=your_username
-export ENGY_PASSWORD=your_password
-gradle run
+read -s ENGY_PASSWORD && export ENGY_PASSWORD   # prompts silently, nothing in shell history
+./gradlew run
 
 # Or override host for beta:
-ENGY_HOST=engy-beta.internal.corp.traderepublic.com gradle run
+ENGY_HOST=engy-beta.internal.corp.traderepublic.com ./gradlew run
 ```
 
 ### Environment variables
