@@ -28,6 +28,11 @@ See the full write-up: [Confluence](https://traderepublic.atlassian.net/wiki/spa
 ## Setup
 
 ```bash
+git clone https://github.com/ivanbutrim/engy-prefetch-probe.git
+cd engy-prefetch-probe
+
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
