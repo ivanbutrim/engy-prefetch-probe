@@ -1,5 +1,15 @@
+# Python
 __pycache__/
 *.pyc
-.env
 .venv/
 venv/
+
+# JVM
+jdbc-probe/.gradle/
+jdbc-probe/build/
+jdbc-probe/gradle/
+jdbc-probe/gradlew
+jdbc-probe/gradlew.bat
+
+# Secrets
+.env

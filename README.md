@@ -35,7 +35,7 @@ Inspects raw HTTP response parameters. Useful for seeing what ENGY returns, but 
 
 ```bash
 git clone https://github.com/ivanbutrim/engy-prefetch-probe.git
-cd engy-prefetch-probe
+cd engy-prefetch-probe/python-probe
 
 python3 -m venv .venv
 source .venv/bin/activate
