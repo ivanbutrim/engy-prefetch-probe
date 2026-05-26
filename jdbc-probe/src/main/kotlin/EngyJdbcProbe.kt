@@ -1,19 +1,12 @@
 import java.sql.DriverManager
 import java.util.Properties
+import java.util.logging.ConsoleHandler
+import java.util.logging.Level
+import java.util.logging.Logger
 
-/**
- * Reproduces the ENGY CLIENT_PREFETCH_THREADS bug using the actual Snowflake JDBC 4.x driver.
- *
- * Unlike the Python probe (which uses snowflake-connector-python), this uses the same
- * driver and code path as production — SnowflakeChunkDownloader, getCommonParams, etc.
- *
- * The DEBUG log from SnowflakeChunkDownloader will print:
- *   #chunks: N #threads: X #slots: Y -> pool: Z
- *
- * If #threads is 0, the bug is confirmed (and the driver will throw
- * IllegalArgumentException: maximumPoolSize must be positive).
- */
 fun main() {
+    suppressNoisyLoggers()
+
     val host = System.getenv("ENGY_HOST") ?: "engy-prd.internal.corp.traderepublic.com"
     val account = System.getenv("ENGY_ACCOUNT") ?: "gm68377.eu-central-1"
     val warehouse = System.getenv("ENGY_WAREHOUSE") ?: "SECURITIES_SERVICES__PIPELINES__XL"
@@ -24,7 +17,6 @@ fun main() {
     }
     val password = System.getenv("ENGY_PASSWORD") ?: System.getenv("SNOWFLAKE_PASSWORD") ?: run {
         print("ENGY password: ")
-        // Console may be null in some environments
         System.console()?.readPassword()?.let { String(it) }
             ?: readlnOrNull()
             ?: error("No password provided")
@@ -48,15 +40,30 @@ fun main() {
         setProperty("password", password)
         setProperty("db", database)
         setProperty("warehouse", warehouse)
-        setProperty("CLIENT_PREFETCH_THREADS", "2")  // same as production EngyConfig.kt
+        setProperty("CLIENT_PREFETCH_THREADS", "4")  // same as production EngyConfig.kt
     }
 
-    println("\n[1/3] Connecting to ENGY via JDBC ...")
+    println("\n[1/4] Connecting to ENGY via JDBC ...")
     val conn = DriverManager.getConnection(jdbcUrl, props)
     println("  Connected.")
 
+    // ---------- Check session parameter value ----------
+    println("\n[2/4] Checking session parameter CLIENT_PREFETCH_THREADS ...")
+    conn.createStatement().use { stmt ->
+        stmt.executeQuery("SHOW PARAMETERS LIKE 'CLIENT_PREFETCH_THREADS'").use { rs ->
+            if (rs.next()) {
+                val key = rs.getString("key")
+                val value = rs.getString("value")
+                val level = rs.getString("level")
+                println("  $key = $value (level: $level)")
+            } else {
+                println("  Parameter not found in SHOW PARAMETERS")
+            }
+        }
+    }
+
     // ---------- Test 1: small query (no chunks) ----------
-    println("\n[2/3] Running tiny query: SELECT 1 ...")
+    println("\n[3/4] Running tiny query: SELECT 1 ...")
     conn.createStatement().use { stmt ->
         stmt.executeQuery("SELECT 1 AS probe").use { rs ->
             rs.next()
@@ -66,14 +73,15 @@ fun main() {
     }
 
     // ---------- Test 2: large query (forces chunked download) ----------
+    // Enable chunk downloader logging right before the large query
+    enableChunkDownloaderLogging()
+
     val largeQuery = """
         SELECT seq4() AS id, RANDSTR(100, RANDOM()) AS payload
         FROM TABLE(GENERATOR(ROWCOUNT => 100000))
     """.trimIndent()
 
-    println("\n[3/3] Running large query (100k rows) to trigger chunking ...")
-    println("  Watch for the SnowflakeChunkDownloader DEBUG log above.")
-    println("  If '#threads: 0' appears, the bug is confirmed.")
+    println("\n[4/4] Running large query (100k rows) to trigger chunking ...")
     println()
 
     try {
@@ -81,6 +89,7 @@ fun main() {
             stmt.executeQuery(largeQuery).use { rs ->
                 var count = 0
                 while (rs.next()) count++
+                println()
                 println("  Rows fetched: $count")
                 println("  SUCCESS — large query completed without crash")
             }
@@ -100,6 +109,29 @@ fun main() {
 
     println()
     println("=".repeat(60))
-    println("Done. Check the SnowflakeChunkDownloader log line above for the")
-    println("'#threads' value to see what ENGY returned.")
+    println("Done.")
+}
+
+fun suppressNoisyLoggers() {
+    // suppress cloud-metadata probes and HTTP retry noise (runs on every local connection)
+    for (prefix in listOf(
+        "net.snowflake.client.internal.jdbc.RestRequest",
+        "net.snowflake.client.jdbc.RestRequest",
+        "net.snowflake.client.jdbc.internal.apache",
+        "net.snowflake.client.internal.jdbc.internal.apache",
+    )) {
+        Logger.getLogger(prefix).level = Level.OFF
+    }
+}
+
+fun enableChunkDownloaderLogging() {
+    val root = Logger.getLogger("")
+    root.level = Level.FINE
+    for (handler in root.handlers) {
+        if (handler is ConsoleHandler) {
+            handler.level = Level.FINE
+        }
+    }
+    // cast a wide net — the package structure varies across driver versions
+    Logger.getLogger("net.snowflake").level = Level.FINE
 }

@@ -8,5 +8,8 @@ venv/
 jdbc-probe/.gradle/
 jdbc-probe/build/
 
+# IDE
+.idea/
+
 # Secrets
 .env

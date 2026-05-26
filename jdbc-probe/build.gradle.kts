@@ -1,6 +1,17 @@
 plugins {
-    kotlin("jvm") version "1.9.22"
+    kotlin("jvm") version "2.1.20"
     application
+}
+
+tasks.withType<JavaCompile> {
+    sourceCompatibility = "23"
+    targetCompatibility = "23"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_23)
+    }
 }
 
 repositories {
