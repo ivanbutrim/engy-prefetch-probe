@@ -13,3 +13,4 @@ jdbc-probe/build/
 
 # Secrets
 .env
+/out/

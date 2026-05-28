@@ -24,27 +24,50 @@ data class EngyConfig(
 
     companion object {
         fun fromEnvironment(): EngyConfig {
-            val user = System.getenv("ENGY_USER")
-                ?: System.getenv("SNOWFLAKE_USER")
+            val user = env("ENGY_USER")
+                ?: env("SNOWFLAKE_USER")
                 ?: promptInput("ENGY user: ")
 
-            val password = System.getenv("ENGY_PASSWORD")
-                ?: System.getenv("SNOWFLAKE_PASSWORD")
+            val password = env("ENGY_PASSWORD")
+                ?: env("SNOWFLAKE_PASSWORD")
                 ?: promptPassword("ENGY password: ")
 
             return EngyConfig(
-                host = System.getenv("ENGY_HOST") ?: "engy-prd.internal.corp.traderepublic.com",
-                account = System.getenv("ENGY_ACCOUNT") ?: "gm68377.eu-central-1",
-                warehouse = System.getenv("ENGY_WAREHOUSE") ?: "SECURITIES_SERVICES__PIPELINES__XL",
-                database = System.getenv("ENGY_DATABASE") ?: "TEAMS_PRD",
+                host = env("ENGY_HOST") ?: "engy-prd.internal.corp.traderepublic.com",
+                account = env("ENGY_ACCOUNT") ?: "gm68377.eu-central-1",
+                warehouse = env("ENGY_WAREHOUSE") ?: "SECURITIES_SERVICES__PIPELINES__XL",
+                database = env("ENGY_DATABASE") ?: "TEAMS_PRD",
                 user = user,
                 password = password,
-                clientPrefetchThreads = System.getenv("CLIENT_PREFETCH_THREADS")?.toInt() ?: 2,
+                clientPrefetchThreads = env("CLIENT_PREFETCH_THREADS")?.toInt() ?: 2,
                 // PROBE_WARMUP=true inserts a SELECT 1 between ENGY SET and the large query.
                 // With warm-up: large query succeeds (driver cache healed).
                 // Without warm-up: large query crashes with "maximumPoolSize must be positive".
-                warmup = System.getenv("PROBE_WARMUP")?.equals("true", ignoreCase = true) == true,
+                warmup = env("PROBE_WARMUP")?.equals("true", ignoreCase = true) == true,
             )
+        }
+
+        // Real process environment wins; otherwise fall back to a gitignored .env file.
+        // Lets the IntelliJ run button supply secrets without a plugin or env-var setup.
+        private fun env(name: String): String? = System.getenv(name) ?: dotenv[name]
+
+        private val dotenv: Map<String, String> by lazy { loadDotenv() }
+
+        private fun loadDotenv(): Map<String, String> {
+            // Walk up from the working directory (IntelliJ's working dir varies) and
+            // also check a jdbc-probe/ subdir, taking the first .env found.
+            val file = generateSequence(java.io.File("").absoluteFile) { it.parentFile }
+                .flatMap { sequenceOf(java.io.File(it, ".env"), java.io.File(it, "jdbc-probe/.env")) }
+                .firstOrNull { it.isFile }
+                ?: return emptyMap()
+
+            return file.readLines()
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && !it.startsWith("#") && it.contains("=") }
+                .associate { line ->
+                    val (key, value) = line.split("=", limit = 2)
+                    key.trim() to value.trim()
+                }
         }
 
         private fun promptInput(prompt: String): String {
