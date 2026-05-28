@@ -1,14 +1,12 @@
 import java.sql.Connection
 import java.sql.DriverManager
 import java.util.Properties
-import java.util.logging.ConsoleHandler
 import java.util.logging.Level
 import java.util.logging.Logger
 
 fun main() {
     val config = EngyConfig.fromEnvironment()
-    val probe = EngyJdbcProbe(config)
-    probe.run()
+    EngyJdbcProbe(config).run()
 }
 
 data class EngyConfig(
@@ -18,7 +16,8 @@ data class EngyConfig(
     val database: String,
     val user: String,
     val password: String,
-    val clientPrefetchThreads: Int = 4,
+    val clientPrefetchThreads: Int = 2,
+    val warmup: Boolean = false,
 ) {
     val jdbcUrl: String
         get() = "jdbc:snowflake://$host/?account=$account&ssl=true&JDBC_QUERY_RESULT_FORMAT=JSON"
@@ -40,6 +39,11 @@ data class EngyConfig(
                 database = System.getenv("ENGY_DATABASE") ?: "TEAMS_PRD",
                 user = user,
                 password = password,
+                clientPrefetchThreads = System.getenv("CLIENT_PREFETCH_THREADS")?.toInt() ?: 2,
+                // PROBE_WARMUP=true inserts a SELECT 1 between ENGY SET and the large query.
+                // With warm-up: large query succeeds (driver cache healed).
+                // Without warm-up: large query crashes with "maximumPoolSize must be positive".
+                warmup = System.getenv("PROBE_WARMUP")?.equals("true", ignoreCase = true) == true,
             )
         }
 
@@ -60,14 +64,14 @@ data class EngyConfig(
 class EngyJdbcProbe(private val config: EngyConfig) {
 
     fun run() {
-        SnowflakeLogging.suppressNoisyLoggers()
+        suppressNoisyLoggers()
         printHeader()
 
-        createConnection().use { conn ->
-            checkSessionParameter(conn)
-            runSmallQuery(conn)
-
-            SnowflakeLogging.enableChunkDownloaderLogging()
+        createDirectConnection().use { conn ->
+            runEngySet(conn)
+            if (config.warmup) {
+                runWarmupQuery(conn)
+            }
             runLargeQuery(conn)
         }
 
@@ -76,58 +80,48 @@ class EngyJdbcProbe(private val config: EngyConfig) {
         println("Done.")
     }
 
-    private fun createConnection(): Connection {
-        println("\n[1/4] Connecting to ENGY via JDBC ...")
+    private fun createDirectConnection(): Connection {
+        println("\n[1/3] Connecting to ENGY via JDBC (DriverManager) ...")
 
         val props = Properties().apply {
             setProperty("user", config.user)
             setProperty("password", config.password)
-            setProperty("db", config.database)
-            setProperty("warehouse", config.warehouse)
             setProperty("CLIENT_PREFETCH_THREADS", config.clientPrefetchThreads.toString())
         }
+        println("  CLIENT_PREFETCH_THREADS in props: ${config.clientPrefetchThreads}")
 
         val conn = DriverManager.getConnection(config.jdbcUrl, props)
         println("  Connected.")
         return conn
     }
 
-    private fun checkSessionParameter(conn: Connection) {
-        println("\n[2/4] Checking session parameter CLIENT_PREFETCH_THREADS ...")
+    private fun runEngySet(conn: Connection) {
+        val setClause = "ENGY SET database = ${config.database}, warehouse = ${config.warehouse}, engine = snowflake, spark_size = XXLARGE"
+        println("\n[2/3] Running ENGY SET ...")
+        println("  SQL: $setClause")
 
         conn.createStatement().use { stmt ->
-            stmt.executeQuery("SHOW PARAMETERS LIKE 'CLIENT_PREFETCH_THREADS'").use { rs ->
-                if (rs.next()) {
-                    val key = rs.getString("key")
-                    val value = rs.getString("value")
-                    val level = rs.getString("level")
-                    println("  $key = $value (level: $level)")
-                } else {
-                    println("  Parameter not found in SHOW PARAMETERS")
-                }
-            }
+            stmt.execute(setClause)
         }
+        println("  OK")
     }
 
-    private fun runSmallQuery(conn: Connection) {
-        println("\n[3/4] Running tiny query: SELECT 1 ...")
-
+    private fun runWarmupQuery(conn: Connection) {
+        println("\n[warm-up] Running SELECT 1 to heal the driver's parameter cache ...")
         conn.createStatement().use { stmt ->
             stmt.executeQuery("SELECT 1 AS probe").use { rs ->
                 rs.next()
                 println("  Result: ${rs.getInt(1)}")
-                println("  OK — small query succeeded (no chunking needed)")
             }
         }
     }
 
     private fun runLargeQuery(conn: Connection) {
-        println("\n[4/4] Running large query ($LARGE_QUERY_ROW_COUNT rows) to trigger chunking ...")
-        println()
+        println("\n[3/3] Running large query ($LARGE_QUERY_ROW_COUNT rows — forces chunked download) ...")
 
         try {
             conn.createStatement().use { stmt ->
-                stmt.executeQuery(largeQuery()).use { rs ->
+                stmt.executeQuery(LARGE_QUERY).use { rs ->
                     var count = 0
                     while (rs.next()) count++
                     println()
@@ -161,43 +155,30 @@ class EngyJdbcProbe(private val config: EngyConfig) {
         println("  Database:   ${config.database}")
         println("  JDBC URL:   ${config.jdbcUrl}")
         println("  Driver:     $driverVersion")
+        println("  Prefetch:   ${config.clientPrefetchThreads}")
+        println("  Warm-up:    ${if (config.warmup) "yes (inserts SELECT 1 between ENGY SET and large query)" else "no"}")
     }
 
     companion object {
         private const val SEPARATOR_WIDTH = 60
         private const val LARGE_QUERY_ROW_COUNT = 100_000
 
-        private fun largeQuery(): String = """
+        private val LARGE_QUERY = """
             SELECT seq4() AS id, RANDSTR(100, RANDOM()) AS payload
             FROM TABLE(GENERATOR(ROWCOUNT => $LARGE_QUERY_ROW_COUNT))
         """.trimIndent()
-    }
-}
 
-object SnowflakeLogging {
+        private val NOISY_LOGGERS = listOf(
+            "net.snowflake.client.internal.jdbc.RestRequest",
+            "net.snowflake.client.jdbc.RestRequest",
+            "net.snowflake.client.jdbc.internal.apache",
+            "net.snowflake.client.internal.jdbc.internal.apache",
+        )
 
-    private val NOISY_LOGGERS = listOf(
-        "net.snowflake.client.internal.jdbc.RestRequest",
-        "net.snowflake.client.jdbc.RestRequest",
-        "net.snowflake.client.jdbc.internal.apache",
-        "net.snowflake.client.internal.jdbc.internal.apache",
-    )
-
-    fun suppressNoisyLoggers() {
-        for (name in NOISY_LOGGERS) {
-            Logger.getLogger(name).level = Level.OFF
-        }
-    }
-
-    fun enableChunkDownloaderLogging() {
-        val root = Logger.getLogger("")
-        root.level = Level.FINE
-        for (handler in root.handlers) {
-            if (handler is ConsoleHandler) {
-                handler.level = Level.FINE
+        private fun suppressNoisyLoggers() {
+            for (name in NOISY_LOGGERS) {
+                Logger.getLogger(name).level = Level.OFF
             }
         }
-        // cast a wide net — the package structure varies across driver versions
-        Logger.getLogger("net.snowflake").level = Level.FINE
     }
 }

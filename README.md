@@ -21,9 +21,10 @@ Small result sets (inline, no chunks) are unaffected. Only queries returning eno
 
 See the full write-up: [Confluence](https://traderepublic.atlassian.net/wiki/spaces/~712020a2d817aaa220474fa1d74a0340578de1/pages/5375623278).
 
-## Key finding
+## Key findings
 
-The Python probe shows `CLIENT_PREFETCH_THREADS = 4` (fix working), but production JDBC still shows `#threads: 0`. ENGY returns different responses depending on client type. **Use the JDBC probe to reproduce the actual failure path.**
+- **The Python probe shows `CLIENT_PREFETCH_THREADS = 4` (fix working), but production JDBC still crashes.** ENGY's response envelopes differ depending on the statement and client type — use the JDBC probe to reproduce the actual failure path.
+- **The crash is ordering-dependent.** It only manifests when a chunked query is the **first statement after `ENGY SET`**. Any intervening query — even `SELECT 1` or `SHOW PARAMETERS` — replaces the bad `CLIENT_PREFETCH_THREADS = 0` in the JDBC driver's parameter cache, and the subsequent large query succeeds. This narrows the bug to the response envelope of `ENGY SET` specifically. `SHOW PARAMETERS` confirms the real session-side value is whatever the client passed in (e.g. `2`); the `0` only ever lives in the driver's in-memory cache.
 
 ---
 
@@ -73,17 +74,19 @@ python engy_prefetch_probe.py -v
 
 ## JDBC probe (Kotlin)
 
-Uses the actual Snowflake JDBC 4.2.0 driver — the same driver and code path as production. Enables `SnowflakeChunkDownloader` DEBUG logging to show:
+Uses the actual Snowflake JDBC 4.2.0 driver — the same driver and code path as production.
 
-```
-#chunks: N #threads: X #slots: Y -> pool: Z
-```
+The probe runs three steps:
 
-If `#threads: 0`, the bug is confirmed and the query will crash with `IllegalArgumentException`.
+1. Connects to ENGY with `CLIENT_PREFETCH_THREADS=2` in JDBC properties.
+2. Runs `ENGY SET database = ..., warehouse = ...`.
+3. Runs a 100k-row synthetic query that forces chunked download → crashes with `IllegalArgumentException: maximumPoolSize must be positive`.
+
+Setting `PROBE_WARMUP=true` inserts a `SELECT 1` between steps 2 and 3. This demonstrates the workaround: any intervening query heals the JDBC driver's parameter cache, so the large query then succeeds.
 
 ### Prerequisites
 
-- JDK 17+
+- JDK 21+
 
 ### Setup & run
 
@@ -92,9 +95,14 @@ cd jdbc-probe
 
 export ENGY_USER=your_username
 read -s ENGY_PASSWORD && export ENGY_PASSWORD   # prompts silently, nothing in shell history
+
+# Reproduce the crash:
 ./gradlew run
 
-# Or override host for beta:
+# Verify the heal (workaround) — large query succeeds:
+PROBE_WARMUP=true ./gradlew run
+
+# Override host for beta:
 ENGY_HOST=engy-beta.internal.corp.traderepublic.com ./gradlew run
 ```
 
@@ -108,8 +116,10 @@ ENGY_HOST=engy-beta.internal.corp.traderepublic.com ./gradlew run
 | `ENGY_DATABASE` | `TEAMS_PRD` | Database |
 | `ENGY_USER` | _(prompt)_ | Username |
 | `ENGY_PASSWORD` | _(prompt)_ | Password |
+| `CLIENT_PREFETCH_THREADS` | `2` | Value passed in JDBC connection properties |
+| `PROBE_WARMUP` | `false` | If `true`, insert `SELECT 1` between `ENGY SET` and the large query (heals the driver cache) |
 
-### Example output (bug present)
+### Example output (bug reproduced)
 
 ```
 ============================================================
@@ -117,21 +127,37 @@ ENGY JDBC 4.x Prefetch-Threads Probe
 ============================================================
   Host:       engy-prd.internal.corp.traderepublic.com
   Driver:     4.2.0
+  Prefetch:   2
+  Warm-up:    no
 
-[1/3] Connecting to ENGY via JDBC ...
+[1/3] Connecting to ENGY via JDBC (DriverManager) ...
+  CLIENT_PREFETCH_THREADS in props: 2
   Connected.
 
-[2/3] Running tiny query: SELECT 1 ...
-  OK — small query succeeded (no chunking needed)
+[2/3] Running ENGY SET ...
+  SQL: ENGY SET database = TEAMS_PRD, warehouse = SECURITIES_SERVICES__PIPELINES__XL, engine = snowflake, spark_size = XXLARGE
+  OK
 
-[3/3] Running large query (100k rows) to trigger chunking ...
-
-18:51:52.193 [main] DEBUG n.s.c.i.j.SnowflakeChunkDownloader - #chunks: 2 #threads: 0 #slots: 0 -> pool: 0
-
+[3/3] Running large query (100000 rows — forces chunked download) ...
   FAILED: JDBC driver internal error: exception creating result
   *** BUG CONFIRMED ***
   SnowflakeChunkDownloader received CLIENT_PREFETCH_THREADS=0
   from ENGY, causing Executors.newFixedThreadPool(0) to throw.
+```
+
+### Example output (heal applied, `PROBE_WARMUP=true`)
+
+```
+...
+[2/3] Running ENGY SET ...
+  OK
+
+[warm-up] Running SELECT 1 to heal the driver's parameter cache ...
+  Result: 1
+
+[3/3] Running large query (100000 rows — forces chunked download) ...
+  Rows fetched: 100000
+  SUCCESS — large query completed without crash
 ```
 
 ---
