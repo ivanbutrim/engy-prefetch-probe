@@ -16,8 +16,23 @@ data class EngyConfig(
     val database: String,
     val user: String,
     val password: String,
-    val clientPrefetchThreads: Int = 2,
+    // null means do NOT set the CLIENT_PREFETCH_THREADS connection property at all,
+    // leaving the driver default — used to confirm ENGY injects 0 regardless of what
+    // (if anything) the client sends.
+    val clientPrefetchThreads: Int? = 2,
     val warmup: Boolean = false,
+    val engine: String = "snowflake",
+    val sparkSize: String = "XXLARGE",
+    // When false, skip the ENGY SET command entirely and instead supply database,
+    // warehouse, engine and spark_size as standard Snowflake connection properties /
+    // session parameters. Used to test whether ENGY SET is what injects the bad
+    // CLIENT_PREFETCH_THREADS=0 into the driver's parameter cache.
+    val useEngySet: Boolean = false,
+    // PROBE_SHOW_PARAMS=true runs SHOW PARAMETERS LIKE 'CLIENT_PREFETCH_THREADS' at each
+    // step to observe the effective value. NOTE: SHOW PARAMETERS is itself a small inline
+    // query, so it heals the cache like the warm-up and will mask the crash — use it to
+    // inspect the value, not together with the crash repro.
+    val showParams: Boolean = false,
 ) {
     val jdbcUrl: String
         get() = "jdbc:snowflake://$host/?account=$account&ssl=true&JDBC_QUERY_RESULT_FORMAT=JSON"
@@ -39,11 +54,23 @@ data class EngyConfig(
                 database = env("ENGY_DATABASE") ?: "TEAMS_PRD",
                 user = user,
                 password = password,
-                clientPrefetchThreads = env("CLIENT_PREFETCH_THREADS")?.toInt() ?: 2,
+                // CLIENT_PREFETCH_THREADS=none (or empty) omits the property entirely;
+                // any integer sets it; absent env keeps the default of 2.
+                clientPrefetchThreads = when (val raw = env("CLIENT_PREFETCH_THREADS")) {
+                    null -> 2
+                    "", "none", "unset", "default" -> null
+                    else -> raw.toInt()
+                },
                 // PROBE_WARMUP=true inserts a SELECT 1 between ENGY SET and the large query.
                 // With warm-up: large query succeeds (driver cache healed).
                 // Without warm-up: large query crashes with "maximumPoolSize must be positive".
                 warmup = env("PROBE_WARMUP")?.equals("true", ignoreCase = true) == true,
+                engine = env("ENGY_ENGINE") ?: "snowflake",
+                sparkSize = env("ENGY_SPARK_SIZE") ?: "XXLARGE",
+                // PROBE_USE_ENGY_SET=false skips ENGY SET and uses standard connection params instead.
+                useEngySet = env("PROBE_USE_ENGY_SET")?.equals("false", ignoreCase = true) != true,
+                // PROBE_SHOW_PARAMS=true prints CLIENT_PREFETCH_THREADS at each step (heals the cache).
+                showParams = env("PROBE_SHOW_PARAMS")?.equals("true", ignoreCase = true) == true,
             )
         }
 
@@ -91,9 +118,18 @@ class EngyJdbcProbe(private val config: EngyConfig) {
         printHeader()
 
         createDirectConnection().use { conn ->
-            runEngySet(conn)
+            if (config.useEngySet) {
+                runEngySet(conn)
+            } else {
+                println("\n[2/3] Skipping ENGY SET — using standard connection params (db, warehouse, engy_engine, engy_spark_size).")
+            }
+            if (config.showParams) {
+                println("\n  *** PROBE_SHOW_PARAMS is on: each SHOW PARAMETERS is an inline query that heals the cache like the warm-up, so it will mask the crash. ***")
+                showPrefetchParam(conn, "after connect / ENGY SET")
+            }
             if (config.warmup) {
                 runWarmupQuery(conn)
+                if (config.showParams) showPrefetchParam(conn, "after warm-up")
             }
             runLargeQuery(conn)
         }
@@ -109,9 +145,22 @@ class EngyJdbcProbe(private val config: EngyConfig) {
         val props = Properties().apply {
             setProperty("user", config.user)
             setProperty("password", config.password)
-            setProperty("CLIENT_PREFETCH_THREADS", config.clientPrefetchThreads.toString())
+            config.clientPrefetchThreads?.let {
+                setProperty("CLIENT_PREFETCH_THREADS", it.toString())
+            }
+            if (!config.useEngySet) {
+                // Standard Snowflake connection properties; ENGY-specific params are
+                // forwarded by the driver as session parameters.
+                setProperty("db", config.database)
+                setProperty("warehouse", config.warehouse)
+                setProperty("engy_engine", config.engine)
+                setProperty("engy_spark_size", config.sparkSize)
+            }
         }
-        println("  CLIENT_PREFETCH_THREADS in props: ${config.clientPrefetchThreads}")
+        println("  CLIENT_PREFETCH_THREADS in props: ${config.clientPrefetchThreads ?: "not set (driver default)"}")
+        if (!config.useEngySet) {
+            println("  db=${config.database}, warehouse=${config.warehouse}, engy_engine=${config.engine}, engy_spark_size=${config.sparkSize}")
+        }
 
         val conn = DriverManager.getConnection(config.jdbcUrl, props)
         println("  Connected.")
@@ -119,7 +168,7 @@ class EngyJdbcProbe(private val config: EngyConfig) {
     }
 
     private fun runEngySet(conn: Connection) {
-        val setClause = "ENGY SET database = ${config.database}, warehouse = ${config.warehouse}, engine = snowflake, spark_size = XXLARGE"
+        val setClause = "ENGY SET database = ${config.database}, warehouse = ${config.warehouse}, engine = ${config.engine}, spark_size = ${config.sparkSize}"
         println("\n[2/3] Running ENGY SET ...")
         println("  SQL: $setClause")
 
@@ -127,6 +176,22 @@ class EngyJdbcProbe(private val config: EngyConfig) {
             stmt.execute(setClause)
         }
         println("  OK")
+    }
+
+    private fun showPrefetchParam(conn: Connection, label: String) {
+        conn.createStatement().use { stmt ->
+            // SHOW PARAMETERS columns: key, value, default, level, description, type.
+            stmt.executeQuery("SHOW PARAMETERS LIKE 'CLIENT_PREFETCH_THREADS'").use { rs ->
+                if (rs.next()) {
+                    val value = rs.getString("value")
+                    val default = rs.getString("default")
+                    val level = rs.getString("level")
+                    println("  [param @ $label] CLIENT_PREFETCH_THREADS = $value (default=$default, level='$level')")
+                } else {
+                    println("  [param @ $label] CLIENT_PREFETCH_THREADS = <not returned>")
+                }
+            }
+        }
     }
 
     private fun runWarmupQuery(conn: Connection) {
@@ -178,7 +243,8 @@ class EngyJdbcProbe(private val config: EngyConfig) {
         println("  Database:   ${config.database}")
         println("  JDBC URL:   ${config.jdbcUrl}")
         println("  Driver:     $driverVersion")
-        println("  Prefetch:   ${config.clientPrefetchThreads}")
+        println("  Prefetch:   ${config.clientPrefetchThreads ?: "not set (driver default)"}")
+        println("  ENGY SET:   ${if (config.useEngySet) "yes (ENGY SET command)" else "no (standard connection params)"}")
         println("  Warm-up:    ${if (config.warmup) "yes (inserts SELECT 1 between ENGY SET and large query)" else "no"}")
     }
 
